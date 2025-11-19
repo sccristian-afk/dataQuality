@@ -19,7 +19,8 @@ from pyspark.sql.types import BooleanType
 spark = SparkSession.builder.getOrCreate()
 
 # COMMAND ----------
-
+def test_print();
+    return "f"
 # DBTITLE 2, 2. Definici贸n de Reglas Custom (Python)
 
 # --- RUL_CUS_001: custom_validate_dni ---
