@@ -24,6 +24,7 @@ from pyspark.sql.types import StringType, DateType
 from delta.tables import DeltaTable
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from pyspark.sql.types import (
     StructType, StructField, StringType, TimestampType, DateType, DecimalType, IntegerType, LongType)
 
@@ -63,7 +64,7 @@ def log_execution_start(execution_id: str, exec_timestamp: datetime , table_id: 
         start_log_df = spark.createDataFrame(
             data=[(
                 execution_id, table_id, exec_timestamp, exec_date, 
-                "RUNNING", None, None, None
+                "START", None, None, None
             )],
             schema=schema
         )
@@ -96,9 +97,10 @@ def log_execution_finish(execution_id, status, duration, validations_exec, valid
 
         delta_trace_table = DeltaTable.forName(spark, trace_table)
         
+        duration_value = Decimal(str(duration))
         # DataFrame con los datos a actualizar
         update_df = spark.createDataFrame(
-            data=[(execution_id, status, duration, validations_exec, validations_fail)],
+            data=[(execution_id, status, duration_value, validations_exec, validations_fail)],
             schema=schema
         )
 
@@ -107,7 +109,7 @@ def log_execution_finish(execution_id, status, duration, validations_exec, valid
          .merge(update_df.alias("source"), "target.execution_id = source.execution_id")
          .whenMatchedUpdate(set={
              "status": "source.status",
-             "duration": "source.duration",
+             "duration_seconds": "source.duration_seconds",
              "validations_executed": "source.validations_executed",
              "validations_failed": "source.validations_failed"
          })
