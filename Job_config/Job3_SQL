@@ -7,7 +7,6 @@ resources:
           notebook_task:
             notebook_path: utils/custom_rules_library_sql
             source: GIT
-            warehouse_id: 0dc3dab2d29b2ceb
       git_source:
         git_url: https://github.com/sccristian-afk/dataQuality.git
         git_provider: gitHub

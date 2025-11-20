@@ -7,7 +7,6 @@ resources:
           notebook_task:
             notebook_path: config/sync_catalog_from_excel
             source: GIT
-            warehouse_id: 0dc3dab2d29b2ceb
       git_source:
         git_url: https://github.com/sccristian-afk/dataQuality.git
         git_provider: gitHub
@@ -26,4 +25,4 @@ resources:
         - name: validations_sheet
           default: Validaciones
         - name: excel_file_path
-          default: /Volumes/workspace/framework_dq/configexcel/configValidaciones_v1.xlsx
+          default: /Volumes/workspace/framework_dq/configexcel/configValidaciones.xlsx

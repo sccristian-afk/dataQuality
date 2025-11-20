@@ -1,0 +1,50 @@
+resources:
+  jobs:
+    DQ_ENGINE:
+      name: DQ_ENGINE
+      max_concurrent_runs: 2
+      tasks:
+        - task_key: run_master1
+          notebook_task:
+            notebook_path: engine/dq_framework_runner
+            source: GIT
+          environment_key: engine_environment
+        - task_key: Unify
+          depends_on:
+            - task_key: run_master1
+          notebook_task:
+            notebook_path: utils/05_unify_evidences
+            source: GIT
+          environment_key: engine_environment
+        - task_key: calculate_persistence
+          depends_on:
+            - task_key: Unify
+          notebook_task:
+            notebook_path: utils/04_calculate_persistence
+            source: GIT
+          environment_key: engine_environment
+      git_source:
+        git_url: https://github.com/sccristian-afk/dataQuality.git
+        git_provider: gitHub
+        git_branch: main
+      queue:
+        enabled: true
+      parameters:
+        - name: catalog_data
+          default: workspace
+        - name: catalog_name
+          default: workspace
+        - name: schema_data
+          default: dummy_data
+        - name: schema_name
+          default: framework_dq
+        - name: table_name
+          default: clientes_run1, clientes_run1
+      environments:
+        - environment_key: calculate_persistence_environment
+          spec:
+            environment_version: "4"
+        - environment_key: engine_environment
+          spec:
+            environment_version: "4"
+      performance_target: PERFORMANCE_OPTIMIZED
