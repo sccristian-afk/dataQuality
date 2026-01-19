@@ -4,12 +4,12 @@ Librería de utilidades del Framework DQ. Contiene funciones auxiliares de loggi
 * `log_execution_start`: marca el inicio de la ejecución
 * `log_execution_finish`: marca el final de la ejecución
 * `log_validations_traceability`: trazabilidada de las validaciones de cada ejecución
-* `log_evidences_staging`: registra las evidencias de cada tabla (una tabla staging por tabla ejecutadaa
+* `log_evidences_staging`: registra las evidencias de cada tabla (una tabla staging por tabla ejecutada)
 '''
 
 # 1. Imports
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, current_timestamp
+from pyspark.sql.functions import col, lit, current_timestamp, udf
 from pyspark.sql.types import StringType, DateType
 from delta.tables import DeltaTable
 import uuid
@@ -25,11 +25,6 @@ def log_execution_start(execution_id: str, exec_timestamp: datetime , table_id: 
     """
     Inserta un registro inicial en la tabla dq_execution_traceability
     
-    Args:
-        execution_id (str): identificador único de la ejecución
-        exec_timestamp (datetime): fecha y hora de inicio de la ejecución
-        table_id (str): identificador de la tabla que se valida
-        trace_table (DataFrame): dataFrame de trazabilidad donde se guarda el log
     """
     try:
         schema = StructType([
@@ -88,7 +83,7 @@ def log_execution_finish(execution_id, status, duration, validations_exec, valid
             schema=schema
         )
 
-        # Actualizar la fila existente basándonos en el execution_id
+        # Actualiza la fila existente basándonos en el execution_id
         (delta_trace_table.alias("target")
          .merge(update_df.alias("source"), "target.execution_id = source.execution_id")
          .whenMatchedUpdate(set={
@@ -153,8 +148,10 @@ def log_evidences_staging(df_failed, staging_table_name, execution_id, exec_date
     
     try:
 
-        # 1. Selecciona las columnas que peuden causar problemas al colisionar el nombre en algunos casos:
-        #    ej: primary_key_col == failed_field
+        # UDF para generar un UUID por fila
+        uuid_udf = udf(lambda: str(uuid.uuid4()), StringType())
+
+        # 1. Selecciona las columnas que pueden causar problemas al colisionar el nombre en algunos casos
         df_transformed = (df_failed.select(
             col(primary_key_col).alias("table_pk"),
             col(failed_field).alias("failed_value")
@@ -164,9 +161,10 @@ def log_evidences_staging(df_failed, staging_table_name, execution_id, exec_date
         df_to_log = (df_transformed
                      .withColumn("execution_id", lit(execution_id))
                      .withColumn("validation_id", lit(validation_id))
-                     .withColumn("execution_date", lit(exec_date)) 
+                     .withColumn("execution_date", lit(exec_date))
+                     .withColumn("evidence_id", uuid_udf())
                      .select(
-                         lit(str(uuid.uuid4())).alias("evidence_id"),
+                         col("evidence_id"),
                          col("execution_id"),
                          col("validation_id"),
                          col("execution_date"),
@@ -178,7 +176,7 @@ def log_evidences_staging(df_failed, staging_table_name, execution_id, exec_date
 
         full_table_name = f"{catalog}.{schema}.{staging_table_name}"
 
-        # Escribir en la tabla de staging SOBRESCRIBIENDO
+        # Escribe en la tabla de staging sobreescribiendo
         (df_to_log.write
          .format("delta")
          .mode("append") 
