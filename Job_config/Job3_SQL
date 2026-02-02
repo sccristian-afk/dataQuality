@@ -1,20 +1,20 @@
 resources:
   jobs:
-    SQL_Functions:
-      name: SQL Functions
+    SQL_Functions_DQ:
+      name: SQL_Functions_DQ
       tasks:
         - task_key: create_sql_functions
           notebook_task:
             notebook_path: utils/custom_rules_library_sql
             source: GIT
       git_source:
-        git_url: https://github.com/sccristian-afk/dataQuality.git
+        git_url: https://github.com/CAF-I-D/dp_datagovernance-data_quality.git
         git_provider: gitHub
         git_branch: main
       queue:
         enabled: true
       parameters:
         - name: catalog_name
-          default: workspace
+          default: sap_databricks_sdg
         - name: schema_name
           default: framework_dq

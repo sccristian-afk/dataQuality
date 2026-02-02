@@ -1,21 +1,24 @@
 resources:
   jobs:
-    Sync_Excel:
-      name: Sync Excel
+    sync_catalog_DQ:
+      name: sync_catalog_DQ
       tasks:
-        - task_key: sync_from_Excel
+        - task_key: sync_catalog
           notebook_task:
-            notebook_path: config/sync_catalog_from_excel
+            notebook_path: config/01_sync_catalog
             source: GIT
+          environment_key: sync_from_Excel_environment
       git_source:
-        git_url: https://github.com/sccristian-afk/dataQuality.git
+        git_url: https://github.com/CAF-I-D/dp_datagovernance-data_quality.git
         git_provider: gitHub
         git_branch: main
       queue:
         enabled: true
       parameters:
         - name: catalog_name
-          default: workspace
+          default: sap_databricks_sdg
+        - name: excel_file_path
+          default: /Volumes/sap_databricks_sdg/framework_dq/validations_data_quality/configValidaciones.xlsm
         - name: rules_sheet
           default: Reglas
         - name: schema_name
@@ -24,5 +27,8 @@ resources:
           default: Tablas
         - name: validations_sheet
           default: Validaciones
-        - name: excel_file_path
-          default: /Volumes/workspace/framework_dq/configexcel/configValidaciones.xlsx
+      environments:
+        - environment_key: sync_from_Excel_environment
+          spec:
+            environment_version: "1"
+      performance_target: PERFORMANCE_OPTIMIZED
