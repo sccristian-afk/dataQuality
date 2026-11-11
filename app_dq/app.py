@@ -125,7 +125,7 @@ for view_name, view_meta in REGISTERED_VIEWS.items():
         st.session_state.feedback_msg = None
         st.rerun()
 
-# 5. Despacho dinámico de la vista activa (Sin bloques 'if/elif' interminables)
+# 5. Despacho dinámico de la vista activa
 vista_activa = st.session_state.active_view
 if vista_activa in REGISTERED_VIEWS:
     REGISTERED_VIEWS[vista_activa].render_func()

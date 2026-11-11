@@ -23,7 +23,8 @@ def init_session_state():
         "active_view": "Alta de Validaciones", 
         "editor_version": 0,
         "select_mode": "none", 
-        "feedback_msg": None
+        "feedback_msg": None,
+        "profiling_result": None
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -55,7 +56,7 @@ def process_logout():
     st.session_state.update(
         authenticated=False, user_email="", user_role="", user_name="", 
         active_view="Alta de Validaciones", select_mode="none", 
-        editor_version=0, feedback_msg=None
+        editor_version=0, feedback_msg=None, profiling_result=None
     )
     st.rerun()
 

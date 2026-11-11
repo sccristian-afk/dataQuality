@@ -4,10 +4,13 @@ CAPA DE PERSISTENCIA Y SERVICIOS BACKEND
 Gestiona la comunicación con Databricks SDK, ejecución segura de consultas
 y transformaciones de reglas técnicas a formato JSON para DQX.
 """
+import re
 import json
 import pandas as pd
-from typing import Optional, List, Dict, Any
+from databricks import sql
+from typing import Optional, List, Dict, Any, Tuple
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.sql import StatementParameterListItem
 from models import ValidationPayload, UserSession
 
 # -----------------------------------------------------------------------------
@@ -59,6 +62,9 @@ MAESTRO_REGLAS: Dict[str, Dict[str, Any]] = {
     }
 }
 
+NUMERIC_PREFIXES = ("INT", "BIGINT", "SMALLINT", "TINYINT", "DOUBLE", "FLOAT", "DECIMAL", "NUMERIC", "LONG", "SHORT")
+
+
 class DatabricksBackend:
     """Cliente del servicio de Databricks y repositorio de datos."""
     def __init__(self, catalog: str = "workspace", schema: str = "default"):
@@ -73,28 +79,251 @@ class DatabricksBackend:
             raise RuntimeError("No se detectó ningún SQL Warehouse activo en el entorno.")
         return warehouses[0].id
 
-    def execute_query(self, sql_query: str):
-        """Ejecuta una consulta SQL en Databricks Statement Execution API."""
+    def execute_query(
+        self,
+        sql_query: str,
+        parameters: Optional[List[StatementParameterListItem]] = None,
+        wait_timeout: str = "30s"
+    ):
+        """Ejecuta una consulta SQL en Databricks Statement Execution API con soporte de parámetros."""
         wid = self.get_warehouse_id()
-        return self.w.statement_execution.execute_statement(
+        resp = self.w.statement_execution.execute_statement(
             statement=sql_query,
             warehouse_id=wid,
             catalog=self.catalog,
             schema=self.schema,
-            wait_timeout="30s"
+            parameters=parameters,
+            wait_timeout=wait_timeout
         )
+        if resp.status and resp.status.error:
+            raise RuntimeError(f"Error SQL en Databricks: {resp.status.error.message}")
+        return resp
+
+    @staticmethod
+    def _validate_table_identifier(table_name: str) -> str:
+        """Valida que el identificador de tabla sea seguro antes de interpolarlo en SQL."""
+        clean = table_name.strip()
+        if not clean or ";" in clean or "--" in clean or "/*" in clean:
+            raise ValueError(f"Identificador de tabla no válido: {table_name}")
+        if not re.match(r"^[A-Za-z0-9_.\-`:]+$", clean):
+            raise ValueError(f"Caracteres no permitidos en el nombre de la tabla: {table_name}")
+        return clean
+
+    @staticmethod
+    def _quote_col(col_name: str) -> str:
+        """Escapa de forma segura el nombre de una columna con backticks."""
+        return f"`{col_name.replace('`', '``')}`"
+
+    def get_table_list(self) -> List[str]:
+        """
+        Retorna las tablas definidas en MAESTRO_TABLAS combinadas con las tablas
+        descubiertas dinámicamente en Unity Catalog (SHOW TABLES).
+        """
+        tables = [meta["technical_name"] for meta in MAESTRO_TABLAS.values()]
+        try:
+            sql_show = f"SHOW TABLES IN `{self.catalog}`.`{self.schema}`"
+            resp = self.execute_query(sql_show)
+            if resp.result and resp.result.data_array:
+                for row in resp.result.data_array:
+                    # En Databricks SHOW TABLES devuelve: [database/namespace, tableName, isTemporary]
+                    if len(row) >= 2 and row[1]:
+                        full_name = f"{self.catalog}.{self.schema}.{row[1]}"
+                        if full_name not in tables:
+                            tables.append(full_name)
+        except Exception:
+            # Si el usuario no tiene permisos de SHOW TABLES en el esquema por defecto,
+            # mantiene las tablas del diccionario maestro sin romper la vista.
+            pass
+        return tables
+
+    def get_table_schema(self, table_name: str) -> List[Tuple[str, str]]:
+        """Obtiene la lista real de (nombre_columna, tipo_dato) desde Unity Catalog."""
+        safe_table = self._validate_table_identifier(table_name)
+        resp = self.execute_query(f"DESCRIBE TABLE {safe_table}")
+        columns: List[Tuple[str, str]] = []
+        if resp.result and resp.result.data_array:
+            for row in resp.result.data_array:
+                col_name = str(row[0]).strip() if row[0] is not None else ""
+                data_type = str(row[1]).strip().upper() if len(row) > 1 and row[1] is not None else "STRING"
+                # Fin de la lista de columnas cuando empiezan las secciones de metadatos/particiones
+                if not col_name or col_name.startswith("#"):
+                    break
+                columns.append((col_name, data_type))
+        return columns
+
+    def compute_table_profiling(
+        self,
+        table_name: str,
+        limit: Optional[int] = None,
+        correlations: bool = False
+    ) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[pd.DataFrame]]:
+        """
+        Ejecuta el perfilado real de la tabla en Databricks SQL:
+        - Obtiene esquema real con DESCRIBE TABLE.
+        - Calcula total de filas, nulos por columna, % de nulos y valores únicos en una sola consulta SQL.
+        - Si correlations=True, calcula la matriz de correlación entre columnas numéricas.
+        """
+        safe_table = self._validate_table_identifier(table_name)
+        schema_cols = self.get_table_schema(safe_table)
+
+        if not schema_cols:
+            raise RuntimeError(f"No se pudieron obtener columnas para la tabla '{safe_table}'.")
+
+        # Subconsulta base (con o sin LIMIT de muestreo)
+        if limit and int(limit) > 0:
+            source_sql = f"(SELECT * FROM {safe_table} LIMIT {int(limit)}) AS _prof_src"
+        else:
+            source_sql = f"{safe_table} AS _prof_src"
+
+        # Construcción de expresiones de agregación en una única pasada
+        agg_exprs = ["COUNT(*) AS `total_rows`"]
+        for idx, (col_name, _) in enumerate(schema_cols):
+            q_col = self._quote_col(col_name)
+            agg_exprs.append(f"(COUNT(*) - COUNT({q_col})) AS `nulls_{idx}`")
+            agg_exprs.append(f"APPROX_COUNT_DISTINCT({q_col}) AS `uniq_{idx}`")
+
+        profile_sql = f"SELECT {', '.join(agg_exprs)} FROM {source_sql}"
+        resp = self.execute_query(profile_sql, wait_timeout="50s")
+
+        if not resp.result or not resp.result.data_array:
+            raise RuntimeError(f"La consulta de perfilado sobre '{safe_table}' no devolvió resultados.")
+
+        row_data = resp.result.data_array[0]
+        total_rows = int(row_data[0]) if row_data[0] is not None else 0
+        total_columns = len(schema_cols)
+
+        stats_rows = []
+        total_null_cells = 0
+        cols_with_nulls = 0
+
+        for idx, (col_name, data_type) in enumerate(schema_cols):
+            nulos = int(row_data[1 + (idx * 2)] or 0)
+            unicos = int(row_data[2 + (idx * 2)] or 0)
+            null_pct = round((nulos / total_rows) * 100.0, 2) if total_rows > 0 else 0.0
+
+            total_null_cells += nulos
+            if nulos > 0:
+                cols_with_nulls += 1
+
+            stats_rows.append({
+                "columna": col_name,
+                "tipo": data_type,
+                "nulos": nulos,
+                "null_pct": null_pct,
+                "unicos": unicos
+            })
+
+        total_cells = total_rows * total_columns
+        global_null_pct = round((total_null_cells / total_cells) * 100.0, 2) if total_cells > 0 else 0.0
+
+        summary_metrics = {
+            "total_rows": total_rows,
+            "total_columns": total_columns,
+            "null_percentage": global_null_pct,
+            "columns_with_nulls": cols_with_nulls
+        }
+
+        col_stats_df = pd.DataFrame(stats_rows)
+
+        # Cálculo opcional de correlaciones reales en SQL para columnas numéricas
+        corr_df: Optional[pd.DataFrame] = None
+        if correlations and total_rows > 1:
+            num_cols = [
+                col_name for col_name, dtype in schema_cols
+                if any(dtype.startswith(prefix) for prefix in NUMERIC_PREFIXES)
+            ][:10]  # Límite de seguridad de hasta 10 columnas numéricas para evitar explosión combinatoria
+
+            if len(num_cols) >= 2:
+                corr_exprs = []
+                pairs: List[Tuple[str, str]] = []
+                for i in range(len(num_cols)):
+                    for j in range(i + 1, len(num_cols)):
+                        c1, c2 = num_cols[i], num_cols[j]
+                        pairs.append((c1, c2))
+                        corr_exprs.append(
+                            f"CORR(CAST({self._quote_col(c1)} AS DOUBLE), CAST({self._quote_col(c2)} AS DOUBLE)) AS `corr_{i}_{j}`"
+                        )
+
+                corr_sql = f"SELECT {', '.join(corr_exprs)} FROM {source_sql}"
+                corr_resp = self.execute_query(corr_sql, wait_timeout="50s")
+                if corr_resp.result and corr_resp.result.data_array:
+                    corr_row = corr_resp.result.data_array[0]
+                    corr_records = []
+                    for idx, (c1, c2) in enumerate(pairs):
+                        val = corr_row[idx]
+                        corr_records.append({
+                            "columna_1": c1,
+                            "columna_2": c2,
+                            "correlacion_pearson": round(float(val), 4) if val is not None else None
+                        })
+                    corr_df = pd.DataFrame(corr_records)
+
+        return summary_metrics, col_stats_df, corr_df
+
+    def save_profiling_history(
+        self,
+        table_name: str,
+        summary_metrics: Dict[str, Any],
+        col_stats: pd.DataFrame,
+        executed_by: str
+    ):
+        """
+        Persiste el resultado del profiling en la tabla histórica de Unity Catalog
+        ({catalog}.{schema}.dq_profiling_history). Crea la tabla si aún no existe.
+        """
+        history_table = f"`{self.catalog}`.`{self.schema}`.`dq_profiling_history`"
+        create_sql = f"""
+            CREATE TABLE IF NOT EXISTS {history_table} (
+                executed_at TIMESTAMP,
+                executed_by STRING,
+                table_name STRING,
+                total_rows BIGINT,
+                total_columns INT,
+                global_null_pct DOUBLE,
+                columna STRING,
+                tipo STRING,
+                nulos BIGINT,
+                null_pct DOUBLE,
+                unicos BIGINT
+            )
+        """
+        self.execute_query(create_sql)
+
+        c_table = table_name.strip().replace("'", "''")
+        c_user = (executed_by or "unknown").strip().replace("'", "''")
+        t_rows = int(summary_metrics.get("total_rows", 0))
+        t_cols = int(summary_metrics.get("total_columns", 0))
+        g_null = float(summary_metrics.get("null_percentage", 0.0))
+
+        values_sql = []
+        for _, row in col_stats.iterrows():
+            col_n = str(row["columna"]).replace("'", "''")
+            col_t = str(row["tipo"]).replace("'", "''")
+            nulos = int(row["nulos"])
+            null_pct = float(row["null_pct"])
+            unicos = int(row["unicos"])
+            values_sql.append(
+                f"(current_timestamp(), '{c_user}', '{c_table}', {t_rows}, {t_cols}, {g_null}, "
+                f"'{col_n}', '{col_t}', {nulos}, {null_pct}, {unicos})"
+            )
+
+        if values_sql:
+            insert_sql = f"INSERT INTO {history_table} VALUES {', '.join(values_sql)}"
+            return self.execute_query(insert_sql)
+        return None
 
     def verify_credentials(self, email: str, password: str) -> Optional[UserSession]:
         """Valida las credenciales contra la tabla de usuarios."""
-        clean_email = email.strip().lower().replace("'", "''")
-        clean_pass = password.strip().replace("'", "''")
-        sql = f"""
-            SELECT email, role, full_name 
-            FROM {self.catalog}.{self.schema}.dq_users 
-            WHERE lower(email) = '{clean_email}' AND password = '{clean_pass}'
-            LIMIT 1
-        """
-        resp = self.execute_query(sql)
+        clean_email = email.strip().lower()
+        clean_pass = password.strip()
+
+        sql_stmt = "SELECT email, role, full_name FROM workspace.default.dq_users WHERE lower(email) = :email AND password = :password LIMIT 1"
+
+        params = [
+            StatementParameterListItem(name="email", value=clean_email, type="STRING"),
+            StatementParameterListItem(name="password", value=clean_pass, type="STRING")
+        ]
+        resp = self.execute_query(sql_stmt, parameters=params)
         if resp.result and resp.result.data_array:
             row = resp.result.data_array[0]
             return UserSession(email=row[0], role=row[1], full_name=row[2])
@@ -102,15 +331,15 @@ class DatabricksBackend:
 
     def fetch_validations(self) -> pd.DataFrame:
         """Recupera el catálogo completo de reglas de validación."""
-        sql = f"""
+        sql_stmt = """
             SELECT validation_id, rule_id, table_id, domain, severity, 
                    is_active, status, owner, Param_columns, Param_value, 
                    Param_range, Param_expression, Param_query_SQL, 
                    Param_merge_columns, validation_definition
-            FROM {self.catalog}.{self.schema}.dq_validations_catalog 
+            FROM workspace.default.dq_validations_catalog 
             ORDER BY validation_id ASC
         """
-        resp = self.execute_query(sql)
+        resp = self.execute_query(sql_stmt)
         if resp.result and resp.result.data_array:
             cols = [col.name for col in resp.manifest.schema.columns]
             return pd.DataFrame(resp.result.data_array, columns=cols)
@@ -156,16 +385,50 @@ class DatabricksBackend:
         return self.execute_query(insert_sql)
 
     def update_status(self, validation_ids: List[str], status: str):
-        """Actualiza el estado de homologación (Draft/Approve) para una lista de IDs."""
-        sql_in = ", ".join([f"'{v}'" for v in validation_ids])
-        sql_update = f"UPDATE {self.catalog}.{self.schema}.dq_validations_catalog SET status = '{status}' WHERE validation_id IN ({sql_in})"
-        return self.execute_query(sql_update)
+        """Actualiza el estado de homologación (Draft/Approve) usando parámetros nativos."""
+        if not validation_ids:
+            return None
+
+        for vid in validation_ids:
+            if not vid.replace("-", "").replace("_", "").isalnum():
+                raise ValueError(f"Identificador de regla no válido: {vid}")
+
+        params = [StatementParameterListItem(name="new_status", value=status, type="STRING")]
+        placeholders = []
+        for idx, vid in enumerate(validation_ids):
+            p_name = f"id_{idx}"
+            placeholders.append(f":{p_name}")
+            params.append(StatementParameterListItem(name=p_name, value=vid, type="STRING"))
+
+        in_clause = ", ".join(placeholders)
+        sql_update = (
+            f"UPDATE {self.catalog}.{self.schema}.dq_validations_catalog SET status = :new_status "
+            + "WHERE validation_id IN (" + in_clause + ")"
+        )
+        return self.execute_query(sql_update, parameters=params)
 
     def delete_drafts(self, validation_ids: List[str]):
-        """Elimina de forma segura únicamente registros en estado Draft."""
-        sql_in = ", ".join([f"'{v}'" for v in validation_ids])
-        sql_delete = f"DELETE FROM {self.catalog}.{self.schema}.dq_validations_catalog WHERE validation_id IN ({sql_in}) AND status = 'Draft'"
-        return self.execute_query(sql_delete)
+        """Elimina de forma segura únicamente registros en estado Draft usando parámetros nativos."""
+        if not validation_ids:
+            return None
+
+        for vid in validation_ids:
+            if not vid.replace("-", "").replace("_", "").isalnum():
+                raise ValueError(f"Identificador de regla no válido: {vid}")
+
+        params = []
+        placeholders = []
+        for idx, vid in enumerate(validation_ids):
+            p_name = f"del_id_{idx}"
+            placeholders.append(f":{p_name}")
+            params.append(StatementParameterListItem(name=p_name, value=vid, type="STRING"))
+
+        in_clause = ", ".join(placeholders)
+        sql_delete = (
+            f"DELETE FROM {self.catalog}.{self.schema}.dq_validations_catalog "
+            + "WHERE validation_id IN (" + in_clause + ") AND status = 'Draft'"
+        )
+        return self.execute_query(sql_delete, parameters=params)
 
     @staticmethod
     def generate_validation_definition(tech_rule: str, col_str: str, val_str: str, 
@@ -173,7 +436,8 @@ class DatabricksBackend:
         """Construye el JSON técnico que consume el framework de ejecución DQX."""
         cols_list = [c.strip() for c in col_str.split(',') if c.strip()]
         if tech_rule in ['is_not_empty', 'is_unique']:
-            if len(cols_list) > 1: return json.dumps({"columns": cols_list})
+            if len(cols_list) > 1:
+                return json.dumps({"columns": cols_list})
             return json.dumps({"column": cols_list[0]} if cols_list else {})
         elif tech_rule == 'regex_match':
             return json.dumps({"column": cols_list[0] if cols_list else "", "regex": val_str})
@@ -191,3 +455,21 @@ class DatabricksBackend:
                 "target_columns": [c.strip() for c in merge_str.split(',') if c.strip()]
             })
         return "{}"
+
+
+# Helpers de nivel de módulo para compatibilidad directa con las vistas
+_default_backend = DatabricksBackend()
+
+def get_table_list() -> List[str]:
+    return _default_backend.get_table_list()
+
+def compute_table_profiling(
+    table_name: str,
+    limit: Optional[int] = None,
+    correlations: bool = False
+) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[pd.DataFrame]]:
+    return _default_backend.compute_table_profiling(
+        table_name=table_name,
+        limit=limit,
+        correlations=correlations
+    )
