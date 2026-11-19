@@ -1,45 +1,42 @@
-"""
-REGISTRO DINÁMICO DE VISTAS (VIEW REGISTRY)
-===========================================
-Permite añadir nuevas páginas o módulos a la aplicación en una sola línea
-sin modificar el enrutador central ni la lógica del menú lateral.
-"""
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 from dataclasses import dataclass
-from views import alta_validaciones, catalogo_reglas, profiling
+from views import alta_validaciones, catalogo_reglas, profiling, configuracion, ejecucion_carga_masiva
+
 
 @dataclass
 class ViewDefinition:
     title: str
-    icon: str
     render_func: Callable[[], None]
-    min_role: Optional[str] = None  # None = Todos, "Owner" = Solo administradores
+    icon: str = ""
+    allowed_roles: Optional[List[str]] = None
+    show_in_sidebar: bool = True
 
-# Diccionario maestro de vistas registradas
+
 REGISTERED_VIEWS: Dict[str, ViewDefinition] = {
-    "Alta de Validaciones": ViewDefinition(
-        title="Alta de Validaciones",
-        icon="📝",
+    "Alta de validaciones": ViewDefinition(
+        title="Alta de validaciones",
         render_func=alta_validaciones.render,
-        min_role=None
+        allowed_roles=["User", "Owner"],
     ),
-    "Catálogo de Reglas": ViewDefinition(
-        title="Catálogo de Reglas",
-        icon="📋",
+    "Ejecución carga masiva": ViewDefinition(
+        title="Ejecución carga masiva",
+        render_func=ejecucion_carga_masiva.render,
+        allowed_roles=["User", "Owner"],
+        show_in_sidebar=False,
+    ),
+    "Catálogo de reglas": ViewDefinition(
+        title="Catálogo de reglas",
         render_func=catalogo_reglas.render,
-        min_role=None
+        allowed_roles=["User", "Owner"],
     ),
     "Profiling": ViewDefinition(
         title="Profiling",
-        icon="📊",
         render_func=profiling.render,
-        min_role=None
+        allowed_roles=["User", "Owner"],
+    ),
+    "Configuración": ViewDefinition(
+        title="Configuración",
+        render_func=configuracion.render,
+        allowed_roles=["Admin"],
     )
 }
-
-def register_view(title: str, icon: str, render_func: Callable[[], None], min_role: Optional[str] = None):
-    """
-    Función de extensión pública:
-    Añade un nuevo módulo o funcionalidad a la app dinámicamente.
-    """
-    REGISTERED_VIEWS[title] = ViewDefinition(title, icon, render_func, min_role)

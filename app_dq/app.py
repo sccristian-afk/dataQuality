@@ -5,7 +5,7 @@ Inicializa Streamlit, inyecta los estilos corporativos de Línea Directa
 y orquesta el ciclo de vida del login y navegación por vistas registradas.
 """
 import streamlit as st
-import ui_logic
+from ui_logic import session as ui_session
 from views import REGISTERED_VIEWS
 
 # 1. Configuración de página e identidad visual
@@ -69,7 +69,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # 2. Inicializar el estado de sesión
-ui_logic.init_session_state()
+ui_session.init_session_state()
 
 # 3. Flujo de Autenticación
 if not st.session_state.authenticated:
@@ -88,46 +88,61 @@ if not st.session_state.authenticated:
                 txt_email = st.text_input("Correo electrónico", placeholder="ejemplo@lineadirecta.es")
                 txt_pass = st.text_input("Contraseña", type="password", placeholder="••••••••")
                 if st.form_submit_button("Iniciar Sesión", type="primary", use_container_width=True):
-                    ui_logic.process_login(txt_email, txt_pass)
+                    ui_session.process_login(txt_email, txt_pass)
             st.markdown("---")
-            st.caption("Cuentas de prueba: `user@lineadirecta.es` / `user123` | `owner@lineadirecta.es` / `owner123`")
+            st.caption("**Cuentas de prueba disponibles:**")
+            st.markdown("""
+                    | Perfil | Correo electrónico | Contraseña |
+                    | :--- | :--- | :--- |
+                    | **User** | `user@lineadirecta.es` | `user123` |
+                    | **Owner** | `owner@lineadirecta.es` | `owner123` |
+                    | **Admin** | `admin@lineadirecta.es` | `admin123` |
+                    """)
     st.stop()
 
-# 4. Barra Lateral Dinámica (Generada automáticamente a partir del registro de vistas)
+# 4. Barra Lateral Dinámica
 st.sidebar.markdown("### LÍNEA DIRECTA")
 st.sidebar.caption("Data Quality Governance Platform")
 st.sidebar.markdown("---")
-st.sidebar.markdown(f"**Usuario:** {st.session_state.user_name}")
 st.sidebar.caption(f"{st.session_state.user_email}")
 
 rol = st.session_state.user_role
-if rol == "Owner":
+if rol == "Admin":
+    st.sidebar.warning("Perfil asignado: **Admin**")
+elif rol == "Owner":
     st.sidebar.success("Perfil asignado: **Owner**")
 else:
     st.sidebar.info("Perfil asignado: **User**")
 
 if st.sidebar.button("Cerrar Sesión", use_container_width=True):
-    ui_logic.process_logout()
+    ui_session.process_logout()
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("#### Navegación")
 
-# Renderizado automatizado del menú de navegación
+# Renderizado automatizado del menú de navegación sin emojis
 for view_name, view_meta in REGISTERED_VIEWS.items():
-    if view_meta.min_role == "Owner" and rol != "Owner":
-        continue  # Oculta vistas exclusivas para perfiles no autorizados
+    if not view_meta.show_in_sidebar:
+        continue
+    if view_meta.allowed_roles is not None and rol not in view_meta.allowed_roles:
+        continue
     
     is_active = (st.session_state.active_view == view_name)
     btn_kind = "primary" if is_active else "secondary"
+    btn_label = f"{view_meta.icon} {view_meta.title}".strip() if view_meta.icon else view_meta.title
     
-    if st.sidebar.button(f"{view_meta.icon} {view_meta.title}", type=btn_kind, use_container_width=True):
+    if st.sidebar.button(btn_label, type=btn_kind, use_container_width=True):
         st.session_state.active_view = view_name
         st.session_state.feedback_msg = None
         st.rerun()
 
-# 5. Despacho dinámico de la vista activa
+# 5. Despacho dinámico de la vista activa con verificación de autorización
 vista_activa = st.session_state.active_view
 if vista_activa in REGISTERED_VIEWS:
-    REGISTERED_VIEWS[vista_activa].render_func()
+    view_def = REGISTERED_VIEWS[vista_activa]
+    if view_def.allowed_roles is not None and rol not in view_def.allowed_roles:
+        st.error("⛔ Acceso denegado: Tu perfil no tiene permisos para acceder a esta vista.")
+    else:
+        view_def.render_func()
 else:
     st.warning(f"La vista '{vista_activa}' no está registrada.")

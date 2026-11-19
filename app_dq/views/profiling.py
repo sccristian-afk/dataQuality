@@ -6,7 +6,7 @@ según permisos (Owner vs User).
 """
 import streamlit as st
 from typing import Optional
-import ui_logic
+from ui_logic import profiling as logic
 
 
 def render():
@@ -28,7 +28,7 @@ def render_profiling_view(role: Optional[str] = None):
 
     with st.container(border=True):
         # 1. Selector de tabla / catálogo
-        tables = ui_logic.db_backend.get_table_list()
+        tables = logic.get_available_tables()
         c_sel, c_custom = st.columns([2, 2])
         with c_sel:
             selected_from_list = st.selectbox(
@@ -73,22 +73,12 @@ def render_profiling_view(role: Optional[str] = None):
             include_correlations = False
 
         if st.button("Ejecutar Profiling", type="primary", key="btn_run_profiling"):
-            with st.spinner(f"Consultando Unity Catalog y calculando métricas para `{selected_table}`..."):
-                try:
-                    summary_metrics, col_stats, corr_df = ui_logic.db_backend.compute_table_profiling(
-                        table_name=selected_table,
-                        limit=sample_size if sample_size and sample_size > 0 else None,
-                        correlations=include_correlations
-                    )
-                    st.session_state.profiling_result = {
-                        "table": selected_table,
-                        "summary": summary_metrics,
-                        "col_stats": col_stats,
-                        "corr_df": corr_df
-                    }
-                except Exception as ex:
-                    st.error(f"No se pudo completar el profiling sobre `{selected_table}`: {str(ex)}")
-                    return
+            if not logic.run_table_profiling(
+                table_name=selected_table,
+                sample_size=sample_size,
+                include_correlations=include_correlations,
+            ):
+                return
 
     # Mostrar resultados persistidos en sesión
     prof_res = st.session_state.get("profiling_result")
@@ -139,17 +129,9 @@ def render_profiling_view(role: Optional[str] = None):
             st.divider()
             st.subheader("Acciones de Administrador")
             if st.button("Guardar reporte en tabla histórica de métricas", key="btn_save_prof"):
-                with st.spinner("Guardando métricas en `workspace.default.dq_profiling_history`..."):
-                    try:
-                        ui_logic.db_backend.save_profiling_history(
-                            table_name=selected_table,
-                            summary_metrics=summary_metrics,
-                            col_stats=col_stats,
-                            executed_by=st.session_state.get("user_email", "owner")
-                        )
-                        st.success(
-                            f"✅ Métricas de `{selected_table}` almacenadas correctamente en "
-                            f"`{ui_logic.db_backend.catalog}.{ui_logic.db_backend.schema}.dq_profiling_history`."
-                        )
-                    except Exception as ex:
-                        st.error(f"Error al guardar el reporte histórico en Unity Catalog: {str(ex)}")
+                logic.save_profiling_report(
+                    table_name=selected_table,
+                    summary_metrics=summary_metrics,
+                    col_stats=col_stats,
+                    executed_by=st.session_state.get("user_email", "owner"),
+                )

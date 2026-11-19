@@ -7,8 +7,7 @@ y transformaciones de reglas técnicas a formato JSON para DQX.
 import re
 import json
 import pandas as pd
-from databricks import sql
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Set
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementParameterListItem
 from models import ValidationPayload, UserSession
@@ -112,7 +111,92 @@ class DatabricksBackend:
     @staticmethod
     def _quote_col(col_name: str) -> str:
         """Escapa de forma segura el nombre de una columna con backticks."""
-        return f"`{col_name.replace('`', '``')}`"
+        escaped = col_name.replace("`", "``")
+        return f"`{escaped}`"
+
+    @staticmethod
+    def _sql_literal(value: Optional[str]) -> str:
+        """Escapa de forma segura cadenas para Spark SQL (incluyendo barras invertidas de RegEx)."""
+        if value is None:
+            return "''"
+        escaped = (
+            str(value)
+            .strip()
+            .replace("\\", "\\\\")
+            .replace("'", "''")
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )
+        return f"'{escaped}'"
+
+    def _build_values_tuple(self, p: ValidationPayload) -> str:
+        """Construye la tupla SQL VALUES (...) correspondiente a un ValidationPayload."""
+        cols_list = [c.strip() for c in p.columns_str.split(",") if c.strip()]
+        if cols_list:
+            cols_joined = ", ".join(self._sql_literal(c) for c in cols_list)
+            sql_param_columns = f"array({cols_joined})"
+        else:
+            sql_param_columns = "array('')"
+
+        tags_list = [t.strip() for t in p.tags_str.split(",") if t.strip()]
+        if tags_list:
+            tags_joined = ", ".join(self._sql_literal(t) for t in tags_list)
+            sql_tags = f"array({tags_joined})"
+        else:
+            sql_tags = "array('Testing')"
+
+        val_def_json = self.generate_validation_definition(
+            p.technical_rule, p.columns_str, p.param_val,
+            p.param_range, p.param_expr, p.param_query, p.param_merge
+        )
+        c_active = "true" if p.is_active else "false"
+
+        return (
+            f"({self._sql_literal(p.id_validacion)}, {self._sql_literal(p.rule_id)}, "
+            f"{self._sql_literal(p.table_id)}, {self._sql_literal(p.perimeter)}, {c_active}, "
+            f"{self._sql_literal(p.severity)}, {self._sql_literal(val_def_json)}, "
+            f"{self._sql_literal(p.owner)}, {sql_tags}, current_timestamp(), "
+            f"{self._sql_literal(p.user_email)}, {self._sql_literal(p.domain)}, {sql_param_columns}, "
+            f"{self._sql_literal(p.param_val)}, '', '', {self._sql_literal(p.param_range)}, '', "
+            f"{self._sql_literal(p.param_expr)}, {self._sql_literal(p.param_query)}, "
+            f"{self._sql_literal(p.param_merge)}, {self._sql_literal(p.status)})"
+        )
+
+    def build_bulk_insert_sql(self, payloads: List[ValidationPayload]) -> str:
+        """Genera una única sentencia INSERT INTO ... VALUES (...), (...) para todo el lote."""
+        if not payloads:
+            raise ValueError("No hay validaciones para construir la sentencia SQL.")
+
+        values_block = ",\n".join(self._build_values_tuple(p) for p in payloads)
+        return f"""INSERT INTO {self.catalog}.{self.schema}.dq_validations_catalog
+(validation_id, rule_id, table_id, perimeter_definition, is_active,
+ severity, validation_definition, owner, tags, updated_at,
+ updated_by, domain, Param_columns, Param_value, Param_value_min,
+ Param_value_max, Param_range, Param_data_type, Param_expression,
+ Param_query_SQL, Param_merge_columns, status)
+VALUES
+{values_block}"""
+
+    def insert_validations_bulk(self, payloads: List[ValidationPayload]):
+        """Ejecuta toda la carga masiva en Unity Catalog en UNA ÚNICA secuencia SQL."""
+        bulk_sql = self.build_bulk_insert_sql(payloads)
+        return self.execute_query(bulk_sql, wait_timeout="50s")
+
+    def get_existing_validation_ids(self, candidate_ids: List[str]) -> Set[str]:
+        """Consulta en una sola llamada qué IDs candidatos ya existen en el catálogo."""
+        clean_ids = [cid.strip() for cid in candidate_ids if cid and cid.strip()]
+        if not clean_ids:
+            return set()
+
+        in_literals = ", ".join(self._sql_literal(cid) for cid in clean_ids)
+        sql_check = (
+            f"SELECT validation_id FROM {self.catalog}.{self.schema}.dq_validations_catalog "
+            f"WHERE validation_id IN ({in_literals})"
+        )
+        resp = self.execute_query(sql_check)
+        if resp.result and resp.result.data_array:
+            return {str(row[0]).strip() for row in resp.result.data_array if row and row[0] is not None}
+        return set()
 
     def get_table_list(self) -> List[str]:
         """
@@ -125,14 +209,11 @@ class DatabricksBackend:
             resp = self.execute_query(sql_show)
             if resp.result and resp.result.data_array:
                 for row in resp.result.data_array:
-                    # En Databricks SHOW TABLES devuelve: [database/namespace, tableName, isTemporary]
                     if len(row) >= 2 and row[1]:
                         full_name = f"{self.catalog}.{self.schema}.{row[1]}"
                         if full_name not in tables:
                             tables.append(full_name)
         except Exception:
-            # Si el usuario no tiene permisos de SHOW TABLES en el esquema por defecto,
-            # mantiene las tablas del diccionario maestro sin romper la vista.
             pass
         return tables
 
@@ -145,7 +226,6 @@ class DatabricksBackend:
             for row in resp.result.data_array:
                 col_name = str(row[0]).strip() if row[0] is not None else ""
                 data_type = str(row[1]).strip().upper() if len(row) > 1 and row[1] is not None else "STRING"
-                # Fin de la lista de columnas cuando empiezan las secciones de metadatos/particiones
                 if not col_name or col_name.startswith("#"):
                     break
                 columns.append((col_name, data_type))
@@ -169,20 +249,19 @@ class DatabricksBackend:
         if not schema_cols:
             raise RuntimeError(f"No se pudieron obtener columnas para la tabla '{safe_table}'.")
 
-        # Subconsulta base (con o sin LIMIT de muestreo)
         if limit and int(limit) > 0:
             source_sql = f"(SELECT * FROM {safe_table} LIMIT {int(limit)}) AS _prof_src"
         else:
             source_sql = f"{safe_table} AS _prof_src"
 
-        # Construcción de expresiones de agregación en una única pasada
         agg_exprs = ["COUNT(*) AS `total_rows`"]
         for idx, (col_name, _) in enumerate(schema_cols):
             q_col = self._quote_col(col_name)
             agg_exprs.append(f"(COUNT(*) - COUNT({q_col})) AS `nulls_{idx}`")
             agg_exprs.append(f"APPROX_COUNT_DISTINCT({q_col}) AS `uniq_{idx}`")
 
-        profile_sql = f"SELECT {', '.join(agg_exprs)} FROM {source_sql}"
+        select_clause = ", ".join(agg_exprs)
+        profile_sql = f"SELECT {select_clause} FROM {source_sql}"
         resp = self.execute_query(profile_sql, wait_timeout="50s")
 
         if not resp.result or not resp.result.data_array:
@@ -225,13 +304,12 @@ class DatabricksBackend:
 
         col_stats_df = pd.DataFrame(stats_rows)
 
-        # Cálculo opcional de correlaciones reales en SQL para columnas numéricas
         corr_df: Optional[pd.DataFrame] = None
         if correlations and total_rows > 1:
             num_cols = [
                 col_name for col_name, dtype in schema_cols
                 if any(dtype.startswith(prefix) for prefix in NUMERIC_PREFIXES)
-            ][:10]  # Límite de seguridad de hasta 10 columnas numéricas para evitar explosión combinatoria
+            ][:10]
 
             if len(num_cols) >= 2:
                 corr_exprs = []
@@ -244,7 +322,8 @@ class DatabricksBackend:
                             f"CORR(CAST({self._quote_col(c1)} AS DOUBLE), CAST({self._quote_col(c2)} AS DOUBLE)) AS `corr_{i}_{j}`"
                         )
 
-                corr_sql = f"SELECT {', '.join(corr_exprs)} FROM {source_sql}"
+                corr_select = ", ".join(corr_exprs)
+                corr_sql = f"SELECT {corr_select} FROM {source_sql}"
                 corr_resp = self.execute_query(corr_sql, wait_timeout="50s")
                 if corr_resp.result and corr_resp.result.data_array:
                     corr_row = corr_resp.result.data_array[0]
@@ -289,26 +368,22 @@ class DatabricksBackend:
         """
         self.execute_query(create_sql)
 
-        c_table = table_name.strip().replace("'", "''")
-        c_user = (executed_by or "unknown").strip().replace("'", "''")
+        c_table = self._sql_literal(table_name)
+        c_user = self._sql_literal(executed_by or "unknown")
         t_rows = int(summary_metrics.get("total_rows", 0))
         t_cols = int(summary_metrics.get("total_columns", 0))
         g_null = float(summary_metrics.get("null_percentage", 0.0))
 
-        values_sql = []
-        for _, row in col_stats.iterrows():
-            col_n = str(row["columna"]).replace("'", "''")
-            col_t = str(row["tipo"]).replace("'", "''")
-            nulos = int(row["nulos"])
-            null_pct = float(row["null_pct"])
-            unicos = int(row["unicos"])
-            values_sql.append(
-                f"(current_timestamp(), '{c_user}', '{c_table}', {t_rows}, {t_cols}, {g_null}, "
-                f"'{col_n}', '{col_t}', {nulos}, {null_pct}, {unicos})"
-            )
+        values_sql = [
+            f"(current_timestamp(), {c_user}, {c_table}, {t_rows}, {t_cols}, {g_null}, "
+            f"{self._sql_literal(row['columna'])}, {self._sql_literal(row['tipo'])}, "
+            f"{int(row['nulos'])}, {float(row['null_pct'])}, {int(row['unicos'])})"
+            for _, row in col_stats.iterrows()
+        ]
 
         if values_sql:
-            insert_sql = f"INSERT INTO {history_table} VALUES {', '.join(values_sql)}"
+            values_joined = ", ".join(values_sql)
+            insert_sql = f"INSERT INTO {history_table} VALUES {values_joined}"
             return self.execute_query(insert_sql)
         return None
 
@@ -317,7 +392,10 @@ class DatabricksBackend:
         clean_email = email.strip().lower()
         clean_pass = password.strip()
 
-        sql_stmt = "SELECT email, role, full_name FROM workspace.default.dq_users WHERE lower(email) = :email AND password = :password LIMIT 1"
+        sql_stmt = (
+            f"SELECT email, role, full_name FROM {self.catalog}.{self.schema}.dq_users "
+            "WHERE lower(email) = :email AND password = :password LIMIT 1"
+        )
 
         params = [
             StatementParameterListItem(name="email", value=clean_email, type="STRING"),
@@ -331,12 +409,12 @@ class DatabricksBackend:
 
     def fetch_validations(self) -> pd.DataFrame:
         """Recupera el catálogo completo de reglas de validación."""
-        sql_stmt = """
+        sql_stmt = f"""
             SELECT validation_id, rule_id, table_id, domain, severity, 
                    is_active, status, owner, Param_columns, Param_value, 
                    Param_range, Param_expression, Param_query_SQL, 
                    Param_merge_columns, validation_definition
-            FROM workspace.default.dq_validations_catalog 
+            FROM {self.catalog}.{self.schema}.dq_validations_catalog 
             ORDER BY validation_id ASC
         """
         resp = self.execute_query(sql_stmt)
@@ -346,43 +424,8 @@ class DatabricksBackend:
         return pd.DataFrame()
 
     def insert_validation(self, p: ValidationPayload):
-        """Inserta una nueva validación en Unity Catalog a partir de un objeto tipado."""
-        cols_list = [c.strip().replace("'", "''") for c in p.columns_str.split(',') if c.strip()]
-        sql_param_columns = f"array({', '.join([repr(c) for c in cols_list])})" if cols_list else "array('')"
-
-        tags_list = [t.strip().replace("'", "''") for t in p.tags_str.split(',') if t.strip()]
-        sql_tags = f"array({', '.join([repr(t) for t in tags_list])})" if tags_list else "array('Testing')"
-
-        val_def_json = self.generate_validation_definition(
-            p.technical_rule, p.columns_str, p.param_val, 
-            p.param_range, p.param_expr, p.param_query, p.param_merge
-        ).replace("'", "''")
-
-        c_id = p.id_validacion.strip().replace("'", "''")
-        c_perim = p.perimeter.strip().replace("'", "''")
-        c_own = p.owner.strip().replace("'", "''")
-        c_val = p.param_val.strip().replace("'", "''")
-        c_range = p.param_range.strip().replace("'", "''")
-        c_expr = p.param_expr.strip().replace("'", "''")
-        c_query = p.param_query.strip().replace("'", "''")
-        c_merge = p.param_merge.strip().replace("'", "''")
-        c_active = "true" if p.is_active else "false"
-
-        insert_sql = f"""
-            INSERT INTO {self.catalog}.{self.schema}.dq_validations_catalog 
-            (validation_id, rule_id, table_id, perimeter_definition, is_active, 
-             severity, validation_definition, owner, tags, updated_at, 
-             updated_by, domain, Param_columns, Param_value, Param_value_min, 
-             Param_value_max, Param_range, Param_data_type, Param_expression, 
-             Param_query_SQL, Param_merge_columns, status)
-            VALUES 
-            ('{c_id}', '{p.rule_id}', '{p.table_id}', '{c_perim}', {c_active},
-             '{p.severity}', '{val_def_json}', '{c_own}', {sql_tags}, current_timestamp(),
-             '{p.user_email}', '{p.domain}', {sql_param_columns}, '{c_val}', '',
-             '', '{c_range}', '', '{c_expr}',
-             '{c_query}', '{c_merge}', '{p.status}')
-        """
-        return self.execute_query(insert_sql)
+        """Inserta una nueva validación en Unity Catalog reutilizando el constructor seguro de tuplas."""
+        return self.insert_validations_bulk([p])
 
     def update_status(self, validation_ids: List[str], status: str):
         """Actualiza el estado de homologación (Draft/Approve) usando parámetros nativos."""
@@ -403,7 +446,7 @@ class DatabricksBackend:
         in_clause = ", ".join(placeholders)
         sql_update = (
             f"UPDATE {self.catalog}.{self.schema}.dq_validations_catalog SET status = :new_status "
-            + "WHERE validation_id IN (" + in_clause + ")"
+            f"WHERE validation_id IN ({in_clause})"
         )
         return self.execute_query(sql_update, parameters=params)
 
@@ -426,33 +469,35 @@ class DatabricksBackend:
         in_clause = ", ".join(placeholders)
         sql_delete = (
             f"DELETE FROM {self.catalog}.{self.schema}.dq_validations_catalog "
-            + "WHERE validation_id IN (" + in_clause + ") AND status = 'Draft'"
+            f"WHERE validation_id IN ({in_clause}) AND status = 'Draft'"
         )
         return self.execute_query(sql_delete, parameters=params)
 
     @staticmethod
-    def generate_validation_definition(tech_rule: str, col_str: str, val_str: str, 
-                                       range_str: str, expr_str: str, query_str: str, merge_str: str) -> str:
+    def generate_validation_definition(
+        tech_rule: str, col_str: str, val_str: str,
+        range_str: str, expr_str: str, query_str: str, merge_str: str
+    ) -> str:
         """Construye el JSON técnico que consume el framework de ejecución DQX."""
-        cols_list = [c.strip() for c in col_str.split(',') if c.strip()]
-        if tech_rule in ['is_not_empty', 'is_unique']:
+        cols_list = [c.strip() for c in col_str.split(",") if c.strip()]
+        if tech_rule in ["is_not_empty", "is_unique"]:
             if len(cols_list) > 1:
                 return json.dumps({"columns": cols_list})
             return json.dumps({"column": cols_list[0]} if cols_list else {})
-        elif tech_rule == 'regex_match':
+        elif tech_rule == "regex_match":
             return json.dumps({"column": cols_list[0] if cols_list else "", "regex": val_str})
-        elif tech_rule == 'is_in_list':
-            allowed = [x.strip() for x in range_str.split(',') if x.strip()]
+        elif tech_rule == "is_in_list":
+            allowed = [x.strip() for x in range_str.split(",") if x.strip()]
             return json.dumps({"column": cols_list[0] if cols_list else "", "allowed": allowed})
-        elif tech_rule == 'sql_expression':
+        elif tech_rule == "sql_expression":
             return json.dumps({"expression": expr_str})
-        elif tech_rule == 'sql_query':
+        elif tech_rule == "sql_query":
             return json.dumps({"query": query_str})
-        elif tech_rule == 'compare_datasets':
+        elif tech_rule == "compare_datasets":
             return json.dumps({
-                "columns": cols_list, 
-                "target_table": val_str, 
-                "target_columns": [c.strip() for c in merge_str.split(',') if c.strip()]
+                "columns": cols_list,
+                "target_table": val_str,
+                "target_columns": [c.strip() for c in merge_str.split(",") if c.strip()]
             })
         return "{}"
 

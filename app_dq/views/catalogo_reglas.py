@@ -4,18 +4,19 @@ VISTA: CATÁLOGO DE REGLAS
 Visualización y gestión interactiva según permisos (Owner vs User).
 """
 import streamlit as st
-import ui_logic
+from ui_logic import catalogo_reglas as logic
 from config import cfg
+
 
 def render():
     st.markdown("""
         <div class="ld-header">
-            <div class="ld-title">Catálogo de Reglas</div>
+            <div class="ld-title">Catálogo de reglas</div>
             <div class="ld-subtitle">Repositorio consolidado de validaciones en Unity Catalog</div>
         </div>
     """, unsafe_allow_html=True)
 
-    df_validaciones = ui_logic.get_validations_data()
+    df_validaciones = logic.get_validations_data()
     total = len(df_validaciones)
     aprobadas = len(df_validaciones[df_validaciones["status"] == "Approve"]) if not df_validaciones.empty and "status" in df_validaciones.columns else 0
     drafts = len(df_validaciones[df_validaciones["status"] == "Draft"]) if not df_validaciones.empty and "status" in df_validaciones.columns else 0
@@ -54,9 +55,9 @@ def render():
 
         st.markdown("<span style='font-size: 0.88rem; font-weight: 600; color: #495057;'>Selección rápida:</span>", unsafe_allow_html=True)
         s1, s2, s3, _ = st.columns([1.8, 1.4, 1.4, 3.4])
-        if s1.button("☑️ Marcar no aprobadas", key="btn_sel_drafts"): ui_logic.process_quick_select("drafts", df_show)
-        if s2.button("☑️ Marcar todas", key="btn_sel_all"): ui_logic.process_quick_select("all")
-        if s3.button("◻️ Desmarcar todas", key="btn_desel_all"): ui_logic.process_quick_select("none")
+        if s1.button("☑️ Marcar no aprobadas", key="btn_sel_drafts"): logic.process_quick_select("drafts", df_show)
+        if s2.button("☑️ Marcar todas", key="btn_sel_all"): logic.process_quick_select("all")
+        if s3.button("◻️ Desmarcar todas", key="btn_desel_all"): logic.process_quick_select("none")
 
         st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
         a1, a2, _ = st.columns([2.2, 2.2, 3.6])
@@ -86,8 +87,8 @@ def render():
         if ids_sel:
             st.caption(f"📌 {len(ids_sel)} de {total} fila(s) seleccionada(s).")
 
-        if btn_aprobar: ui_logic.process_approve(ids_sel, filas_sel)
-        if btn_eliminar: ui_logic.process_delete(ids_sel, filas_sel)
+        if btn_aprobar: logic.process_approve(ids_sel, filas_sel)
+        if btn_eliminar: logic.process_delete(ids_sel, filas_sel)
 
     else:
         # Rol User (Solo lectura)
